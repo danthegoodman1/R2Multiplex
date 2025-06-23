@@ -1,0 +1,25 @@
+{
+	"name": "r2-multiplex",
+	"version": "0.0.0",
+	"private": true,
+	"scripts": {
+		"deploy": "wrangler deploy",
+		"dev": "wrangler dev",
+		"start": "wrangler dev",
+		"test": "vitest",
+		"cf-typegen": "wrangler types"
+	},
+	"devDependencies": {
+		"@aws-sdk/client-s3": "^3.832.0",
+		"@aws-sdk/s3-request-presigner": "^3.832.0",
+		"@cloudflare/vitest-pool-workers": "^0.8.19",
+		"typescript": "^5.5.2",
+		"vitest": "~3.2.0",
+		"wrangler": "^4.20.5"
+	},
+	"dependencies": {
+		"@aws-crypto/sha256-js": "^5.2.0",
+		"@smithy/protocol-http": "^5.1.2",
+		"@smithy/signature-v4": "^5.1.2"
+	}
+}
