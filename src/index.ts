@@ -1,6 +1,7 @@
 import { SignatureV4 } from '@smithy/signature-v4';
 import { Sha256 } from '@aws-crypto/sha256-js';
 import { HttpRequest } from '@smithy/protocol-http';
+import { XMLParser, XMLBuilder } from 'fast-xml-parser';
 
 const buckets = ['aaaa', 'bbbb'];
 const myBucket = 'multiplex';
@@ -46,17 +47,13 @@ async function verifySignature(req: Request, env: Env, bodyContent?: ArrayBuffer
 			return false;
 		}
 
-		// console.log('Authorization header:', authHeader);
 		const parsedAuth = parseAuthorizationHeader(authHeader);
-		// console.log('Parsed auth:', parsedAuth);
 
 		// Check if the access key matches our expected client key
 		if (parsedAuth.accessKeyId !== env.CLIENT_ACCESS_KEY) {
 			console.log(`Access key mismatch: ${parsedAuth.accessKeyId} !== ${env.CLIENT_ACCESS_KEY}`);
 			return false;
 		}
-
-		// console.log('Access key matches, verifying signature...');
 
 		// Create a signer with the client credentials to verify the signature
 		const verifier = new SignatureV4({
@@ -71,10 +68,6 @@ async function verifySignature(req: Request, env: Env, bodyContent?: ArrayBuffer
 
 		const url = new URL(req.url);
 
-		// console.log('Request URL:', req.url);
-		// console.log('Request method:', req.method);
-		// console.log('Request headers:', Object.fromEntries(req.headers));
-
 		// Create HttpRequest for signature verification - only include signed headers
 		const signedHeadersOnly: Record<string, string> = {};
 		for (const headerName of parsedAuth.signedHeaders) {
@@ -83,8 +76,6 @@ async function verifySignature(req: Request, env: Env, bodyContent?: ArrayBuffer
 				signedHeadersOnly[headerName] = headerValue;
 			}
 		}
-
-		// console.log('Signed headers only:', signedHeadersOnly);
 
 		const httpRequest = new HttpRequest({
 			method: req.method,
@@ -107,8 +98,6 @@ async function verifySignature(req: Request, env: Env, bodyContent?: ArrayBuffer
 		}
 
 		const expectedParsed = parseAuthorizationHeader(expectedAuthHeader);
-		// console.log('Expected signature:', expectedParsed.signature);
-		// console.log('Received signature:', parsedAuth.signature);
 
 		// Compare signatures
 		const signaturesMatch = parsedAuth.signature === expectedParsed.signature;
@@ -118,6 +107,255 @@ async function verifySignature(req: Request, env: Env, bodyContent?: ArrayBuffer
 		console.error('Signature verification failed:', error);
 		return false;
 	}
+}
+
+// Types for ListObjectsV2 response structure
+interface S3Object {
+	Key: string;
+	LastModified: string;
+	ETag: string;
+	Size: number;
+	StorageClass: string;
+	Owner?: {
+		ID: string;
+		DisplayName: string;
+	};
+}
+
+interface CommonPrefix {
+	Prefix: string;
+}
+
+interface ListObjectsV2Response {
+	Name: string;
+	Prefix?: string;
+	KeyCount: number;
+	MaxKeys: number;
+	IsTruncated: boolean;
+	Contents?: S3Object[];
+	CommonPrefixes?: CommonPrefix[];
+	ContinuationToken?: string;
+	NextContinuationToken?: string;
+	StartAfter?: string;
+	Delimiter?: string;
+}
+
+// Create a signed request to R2
+async function createSignedR2Request(
+	method: string,
+	bucketName: string,
+	path: string,
+	env: Env,
+	queryParams?: URLSearchParams,
+	headers?: Headers,
+	body?: ArrayBuffer
+): Promise<Request> {
+	const targetUrl = new URL(`https://${env.ACCOUNT_ID}.r2.cloudflarestorage.com/${bucketName}${path}`);
+	if (queryParams) {
+		targetUrl.search = queryParams.toString();
+	}
+
+	const r2Headers = new Headers();
+
+	// Filter headers to exclude Cloudflare-specific ones that get modified during forwarding
+	if (headers) {
+		for (const [key, value] of headers.entries()) {
+			const lowerKey = key.toLowerCase();
+			// Skip headers that Cloudflare modifies or adds when forwarding
+			if (lowerKey.startsWith('cf-') || lowerKey === 'x-forwarded-for' || lowerKey === 'x-real-ip' || lowerKey === 'host') {
+				continue;
+			}
+			r2Headers.set(key, value);
+		}
+	}
+
+	r2Headers.set('host', targetUrl.host);
+
+	// Calculate body hash for the signature
+	const hash = new Sha256();
+	hash.update(body || new Uint8Array());
+	const bodyHash = toHex(await hash.digest());
+	r2Headers.set('x-amz-content-sha256', bodyHash);
+
+	const signer = new SignatureV4({
+		credentials: { accessKeyId: env.R2_KEY, secretAccessKey: env.R2_SECRET },
+		service: 's3',
+		region: 'auto',
+		sha256: Sha256,
+	});
+
+	const signed = await signer.sign(
+		new HttpRequest({
+			method,
+			headers: Object.fromEntries(r2Headers.entries()),
+			hostname: targetUrl.hostname,
+			path: targetUrl.pathname,
+			query: queryParams ? Object.fromEntries(queryParams.entries()) : undefined,
+			body,
+			protocol: 'https:',
+		})
+	);
+
+	return new Request(targetUrl.toString(), {
+		method: signed.method,
+		headers: signed.headers,
+		body,
+	});
+}
+
+// Handle ListObjectsV2 requests by orchestrating across all buckets
+async function handleListObjectsV2(req: Request, env: Env): Promise<Response> {
+	const url = new URL(req.url);
+	const params = url.searchParams;
+
+	// Extract ListObjectsV2 parameters
+	const prefix = params.get('prefix') || '';
+	const delimiter = params.get('delimiter');
+	const maxKeys = parseInt(params.get('max-keys') || '1000');
+	const continuationToken = params.get('continuation-token');
+	const startAfter = params.get('start-after');
+	const fetchOwner = params.get('fetch-owner') === 'true';
+
+	// Parse continuation token if present
+	let parsedToken: { bucket: string; key: string; position: number } | null = null;
+	if (continuationToken) {
+		try {
+			parsedToken = JSON.parse(atob(continuationToken));
+		} catch (error) {
+			return new Response('Invalid continuation token', { status: 400 });
+		}
+	}
+
+	// Create requests to all buckets
+	const bucketRequests = buckets.map(async (bucketName) => {
+		const bucketParams = new URLSearchParams();
+		bucketParams.set('list-type', '2');
+		if (prefix) bucketParams.set('prefix', prefix);
+		if (delimiter) bucketParams.set('delimiter', delimiter);
+		bucketParams.set('max-keys', '1000'); // Get more from each bucket to ensure proper sorting
+		if (startAfter) bucketParams.set('start-after', startAfter);
+		if (fetchOwner) bucketParams.set('fetch-owner', 'true');
+
+		// Handle continuation for this specific bucket
+		if (parsedToken && parsedToken.bucket === bucketName) {
+			bucketParams.set('start-after', parsedToken.key);
+		}
+
+		const signedRequest = await createSignedR2Request('GET', bucketName, '/', env, bucketParams);
+		console.log(`ListObjectsV2 request to bucket ${bucketName}:`, signedRequest.url);
+
+		const response = await fetch(signedRequest);
+
+		if (!response.ok) {
+			console.log(`ListObjectsV2 failed for bucket ${bucketName}:`, response.status, response.statusText);
+			const errorBody = await response.text();
+			console.log('ListObjectsV2 Error Body:', errorBody);
+			throw new Error(`Failed to list objects in bucket ${bucketName}: ${response.statusText}`);
+		}
+
+		const xmlText = await response.text();
+		const parser = new XMLParser({
+			ignoreAttributes: false,
+			parseAttributeValue: true,
+		});
+
+		return {
+			bucketName,
+			data: parser.parse(xmlText) as { ListBucketResult: ListObjectsV2Response },
+		};
+	});
+
+	// Wait for all bucket requests to complete
+	const bucketResults = await Promise.all(bucketRequests);
+
+	// Merge and process results
+	const allObjects: S3Object[] = [];
+	const allCommonPrefixes: Set<string> = new Set();
+
+	for (const result of bucketResults) {
+		const bucketResult = result.data.ListBucketResult;
+
+		if (bucketResult.Contents) {
+			const contents = Array.isArray(bucketResult.Contents) ? bucketResult.Contents : [bucketResult.Contents];
+			allObjects.push(...contents);
+		}
+
+		if (bucketResult.CommonPrefixes) {
+			const prefixes = Array.isArray(bucketResult.CommonPrefixes) ? bucketResult.CommonPrefixes : [bucketResult.CommonPrefixes];
+			prefixes.forEach((cp) => allCommonPrefixes.add(cp.Prefix));
+		}
+	}
+
+	// Sort objects lexicographically by key (as per S3 API)
+	allObjects.sort((a, b) => a.Key.localeCompare(b.Key));
+
+	// Handle pagination - find starting position
+	let startIndex = 0;
+	if (parsedToken) {
+		startIndex = allObjects.findIndex((obj) => obj.Key > parsedToken!.key);
+		if (startIndex === -1) startIndex = allObjects.length;
+	} else if (startAfter) {
+		startIndex = allObjects.findIndex((obj) => obj.Key > startAfter);
+		if (startIndex === -1) startIndex = allObjects.length;
+	}
+
+	// Slice to maxKeys limit
+	const resultObjects = allObjects.slice(startIndex, startIndex + maxKeys);
+	const isTruncated = startIndex + maxKeys < allObjects.length;
+
+	// Generate next continuation token if needed
+	let nextContinuationToken: string | undefined;
+	if (isTruncated && resultObjects.length > 0) {
+		const lastKey = resultObjects[resultObjects.length - 1].Key;
+		const lastBucket = pickBucket(lastKey);
+		const token = {
+			bucket: lastBucket,
+			key: lastKey,
+			position: startIndex + resultObjects.length,
+		};
+		nextContinuationToken = btoa(JSON.stringify(token));
+	}
+
+	// Build response
+	const response: ListObjectsV2Response = {
+		Name: myBucket,
+		KeyCount: resultObjects.length,
+		MaxKeys: maxKeys,
+		IsTruncated: isTruncated,
+		Contents: resultObjects.length > 0 ? resultObjects : undefined,
+	};
+
+	if (prefix) response.Prefix = prefix;
+	if (delimiter) response.Delimiter = delimiter;
+	if (continuationToken) response.ContinuationToken = continuationToken;
+	if (nextContinuationToken) response.NextContinuationToken = nextContinuationToken;
+	if (startAfter) response.StartAfter = startAfter;
+	if (allCommonPrefixes.size > 0) {
+		response.CommonPrefixes = Array.from(allCommonPrefixes)
+			.sort()
+			.map((prefix) => ({ Prefix: prefix }));
+	}
+
+	// Convert to XML
+	const builder = new XMLBuilder({
+		ignoreAttributes: false,
+		format: true,
+	});
+
+	const xmlResponse = builder.build({
+		ListBucketResult: {
+			'@_xmlns': 'http://s3.amazonaws.com/doc/2006-03-01/',
+			...response,
+		},
+	});
+
+	return new Response(xmlResponse, {
+		headers: {
+			'Content-Type': 'application/xml',
+			'x-amz-request-id': crypto.randomUUID(),
+		},
+		status: 200,
+	});
 }
 
 export default {
@@ -136,15 +374,17 @@ export default {
 
 		const url = new URL(req.url);
 
-		// 1. Extract the object key, handling bucket names in the path
-		// Path format: /bucket/key or /key (depending on how the client sends it)
+		// Check if this is a ListObjectsV2 request
+		if (req.method === 'GET' && url.searchParams.get('list-type') === '2') {
+			return await handleListObjectsV2(req, env);
+		}
+
+		// Extract the object key, handling bucket names in the path
 		let key = url.pathname.slice(1); // Remove leading slash
 
 		// If the path starts with a bucket name, remove it
-		// since we'll determine the actual bucket through consistent hashing
 		const pathParts = key.split('/');
 		if (pathParts.length > 1 && pathParts[0] === myBucket) {
-			// Remove the virtual bucket name, keep the rest as the key
 			console.log('removed bucket name from path');
 			key = pathParts.slice(1).join('/');
 		}
@@ -155,56 +395,39 @@ export default {
 			return new Response('Bad Request: No key specified', { status: 400 });
 		}
 
-		const bucket = pickBucket(key); // your consistent-hash function
+		const bucket = pickBucket(key);
 		console.log('Selected bucket:', bucket, 'for key:', key);
-		const target = `https://${env.ACCOUNT_ID}.r2.cloudflarestorage.com/${bucket}/${key}`;
-		const targetUrl = new URL(target);
 
-		// Create a fresh set of headers for the R2 request. We can't just forward the original
-		// request because the host and signature are different.
-		const r2Headers = new Headers();
+		// Forward the request to the selected bucket
+		const signedRequest = await createSignedR2Request(req.method, bucket, `/${key}`, env, url.searchParams, req.headers, bodyContent);
 
-		// Copy over relevant non-auth headers from the original request
-		const headersToCopy = ['content-type', 'content-encoding', 'content-disposition', 'cache-control'];
-		for (const headerName of headersToCopy) {
-			if (req.headers.has(headerName)) {
-				r2Headers.set(headerName, req.headers.get(headerName)!);
-			}
+		// console.log('Forwarding to R2:', {
+		// 	method: req.method,
+		// 	bucket,
+		// 	key,
+		// 	targetUrl: signedRequest.url,
+		// 	headers: Object.fromEntries(signedRequest.headers.entries()),
+		// });
+
+		const resp = await fetch(signedRequest);
+
+		// console.log('R2 Response:', {
+		// 	status: resp.status,
+		// 	statusText: resp.statusText,
+		// 	headers: Object.fromEntries(resp.headers.entries()),
+		// });
+
+		if (!resp.ok) {
+			const errorBody = await resp.text();
+			// console.log('R2 Error Body:', errorBody);
+			// Return the R2 error response
+			return new Response(errorBody, {
+				status: resp.status,
+				statusText: resp.statusText,
+				headers: resp.headers,
+			});
 		}
 
-		// Set required SigV4 headers
-		r2Headers.set('host', targetUrl.host);
-
-		// Calculate body hash for the signature
-		const hash = new Sha256();
-		hash.update(bodyContent || new Uint8Array());
-		const bodyHash = toHex(await hash.digest());
-		r2Headers.set('x-amz-content-sha256', bodyHash);
-
-		const signer = new SignatureV4({
-			credentials: { accessKeyId: env.R2_KEY, secretAccessKey: env.R2_SECRET },
-			service: 's3',
-			region: 'auto',
-			sha256: Sha256,
-		});
-
-		const signed = await signer.sign(
-			new HttpRequest({
-				method: req.method,
-				headers: Object.fromEntries(r2Headers.entries()),
-				hostname: targetUrl.hostname,
-				path: targetUrl.pathname,
-				body: bodyContent,
-				protocol: 'https:',
-			})
-		);
-
-		// Forward the signed request to R2
-		const resp = await fetch(target, {
-			method: signed.method,
-			headers: signed.headers,
-			body: bodyContent,
-		});
 		return resp;
 	},
 } satisfies ExportedHandler<Env>;

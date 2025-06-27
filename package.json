@@ -20,6 +20,7 @@
 	"dependencies": {
 		"@aws-crypto/sha256-js": "^5.2.0",
 		"@smithy/protocol-http": "^5.1.2",
-		"@smithy/signature-v4": "^5.1.2"
+		"@smithy/signature-v4": "^5.1.2",
+		"fast-xml-parser": "^5.2.5"
 	}
 }
