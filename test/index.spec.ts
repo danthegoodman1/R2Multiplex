@@ -36,36 +36,61 @@ describe('R2 Multiplex Worker', () => {
 				{ key: 'logs/file10.log', content: 'Content of file 10 - log entry' },
 			];
 
-			// Write all 10 files using S3 PutObject
-			console.log('Writing 10 files using AWS SDK...');
-			for (const file of testFiles) {
-				const putCommand = new PutObjectCommand({
-					Bucket: 'multiplex', // This is our virtual bucket name
-					Key: file.key,
-					Body: file.content,
-					ContentType: 'text/plain',
+			try {
+				// Write all 10 files using S3 PutObject (in parallel)
+				console.log('Writing 10 files using AWS SDK...');
+				const putPromises = testFiles.map(async (file) => {
+					const putCommand = new PutObjectCommand({
+						Bucket: 'multiplex', // This is our virtual bucket name
+						Key: file.key,
+						Body: file.content,
+						ContentType: 'text/plain',
+					});
+
+					// Instead of using the S3 client directly, we'll intercept the signed request
+					// and send it to our worker
+					const request = await s3Client.send(putCommand);
+					console.log(`PUT ${file.key}: Success`);
+					return request;
 				});
 
-				// Instead of using the S3 client directly, we'll intercept the signed request
-				// and send it to our worker
-				const request = await s3Client.send(putCommand);
-				console.log(`PUT ${file.key}: Success`);
-			}
+				await Promise.all(putPromises);
 
-			// Read all 10 files back using S3 GetObject
-			console.log('Reading 10 files back using AWS SDK...');
-			for (const file of testFiles) {
-				const getCommand = new GetObjectCommand({
-					Bucket: 'multiplex',
-					Key: file.key,
+				// Read all 10 files back using S3 GetObject (in parallel)
+				console.log('Reading 10 files back using AWS SDK...');
+				const getPromises = testFiles.map(async (file) => {
+					const getCommand = new GetObjectCommand({
+						Bucket: 'multiplex',
+						Key: file.key,
+					});
+
+					const response = await s3Client.send(getCommand);
+
+					if (response.Body) {
+						const responseText = await response.Body.transformToString();
+						console.log(`GET ${file.key}: "${responseText}"`);
+						expect(responseText).toBe(file.content);
+					}
 				});
 
-				const response = await s3Client.send(getCommand);
+				await Promise.all(getPromises);
+			} finally {
+				// Cleanup: Delete all test files regardless of test outcome
+				console.log('Cleaning up test files...');
+				try {
+					const deletePromises = testFiles.map((file) => {
+						const deleteCommand = new DeleteObjectCommand({
+							Bucket: 'multiplex',
+							Key: file.key,
+						});
+						return s3Client.send(deleteCommand);
+					});
 
-				if (response.Body) {
-					const responseText = await response.Body.transformToString();
-					console.log(`GET ${file.key}: "${responseText}"`);
-					expect(responseText).toBe(file.content);
+					await Promise.all(deletePromises);
+					console.log(`Cleanup completed. Deleted ${testFiles.length} test files`);
+				} catch (cleanupError) {
+					console.error('Cleanup failed:', cleanupError);
+					// Don't throw cleanup errors - they shouldn't fail the test
 				}
 			}
 		},
@@ -85,8 +110,10 @@ describe('R2 Multiplex Worker', () => {
 			console.log(`Testing ListObjectsV2 with ${numFiles} files using prefix: ${testPrefix}`);
 
 			try {
-				// Generate and create 1000 random files
-				console.log('Creating 1000 random files...');
+				// Generate and create files in parallel
+				console.log(`Creating ${numFiles} random files...`);
+				const fileCreationPromises = [];
+
 				for (let i = 0; i < numFiles; i++) {
 					const randomSuffix = Math.random().toString(36).substring(2, 15);
 					const fileKey = `${testPrefix}file-${i.toString().padStart(4, '0')}-${randomSuffix}.txt`;
@@ -101,12 +128,11 @@ describe('R2 Multiplex Worker', () => {
 						ContentType: 'text/plain',
 					});
 
-					await s3Client.send(putCommand);
-
-					if (i % 100 === 0) {
-						console.log(`Created ${i + 1}/${numFiles} files...`);
-					}
+					fileCreationPromises.push(s3Client.send(putCommand));
 				}
+
+				await Promise.all(fileCreationPromises);
+				console.log(`Successfully created ${numFiles} files in parallel`);
 
 				console.log(`Successfully attempted to create ${numFiles} files`);
 
@@ -177,25 +203,23 @@ describe('R2 Multiplex Worker', () => {
 				const allFilesHaveCorrectPrefix = listedFiles.every((file) => file.startsWith(testPrefix));
 				expect(allFilesHaveCorrectPrefix).toBe(true);
 			} finally {
-				// Cleanup: Delete all created files regardless of test outcome
+				// Cleanup: Delete all created files in parallel
 				console.log('Cleaning up created files...');
-				let deletedCount = 0;
-
-				for (const fileKey of createdFiles) {
-					const deleteCommand = new DeleteObjectCommand({
-						Bucket: 'multiplex',
-						Key: fileKey,
+				try {
+					const deletePromises = createdFiles.map((fileKey) => {
+						const deleteCommand = new DeleteObjectCommand({
+							Bucket: 'multiplex',
+							Key: fileKey,
+						});
+						return s3Client.send(deleteCommand);
 					});
 
-					await s3Client.send(deleteCommand);
-					deletedCount++;
-
-					if (deletedCount % 100 === 0) {
-						console.log(`Deleted ${deletedCount}/${createdFiles.length} files...`);
-					}
+					await Promise.all(deletePromises);
+					console.log(`Cleanup completed. Deleted ${createdFiles.length}/${createdFiles.length} files`);
+				} catch (cleanupError) {
+					console.error('Cleanup failed:', cleanupError);
+					// Don't throw cleanup errors - they shouldn't fail the test
 				}
-
-				console.log(`Cleanup completed. Deleted ${deletedCount}/${createdFiles.length} files`);
 			}
 		},
 		{
