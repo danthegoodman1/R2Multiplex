@@ -31,8 +31,6 @@ The major enhancement is full ListObjectsV2 API compatibility. When a ListObject
    - `start-after` - Start listing after a specific key
    - `fetch-owner` - Include object owner information
 
-5. **Proper XML Response**: Generates fully compliant S3 XML responses with all required elements
-
 ### Example ListObjectsV2 Usage
 
 ```bash
