@@ -247,9 +247,9 @@ async function handleListObjectsV2(req: Request, env: Env): Promise<Response> {
 		const response = await fetch(signedRequest);
 
 		if (!response.ok) {
-			console.log(`ListObjectsV2 failed for bucket ${bucketName}:`, response.status, response.statusText);
+			console.error(`ListObjectsV2 failed for bucket ${bucketName}:`, response.status, response.statusText);
 			const errorBody = await response.text();
-			console.log('ListObjectsV2 Error Body:', errorBody);
+			console.error('ListObjectsV2 Error Body:', errorBody);
 			throw new Error(`Failed to list objects in bucket ${bucketName}: ${response.statusText}`);
 		}
 
