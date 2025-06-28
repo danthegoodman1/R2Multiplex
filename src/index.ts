@@ -374,9 +374,33 @@ export default {
 
 		const url = new URL(req.url);
 
-		// Check if this is a ListObjectsV2 request
-		if (req.method === 'GET' && url.searchParams.get('list-type') === '2') {
-			return await handleListObjectsV2(req, env);
+		// Check for cross-bucket operations that need special handling
+		if (req.method === 'GET') {
+			// ListObjectsV2 - implemented
+			if (url.searchParams.get('list-type') === '2') {
+				return await handleListObjectsV2(req, env);
+			}
+
+			// ListObjects (v1) - not implemented yet
+			if (url.searchParams.has('list-type') && url.searchParams.get('list-type') === '1') {
+				return new Response('ListObjects v1 not implemented yet', { status: 501 });
+			}
+
+			// If no list-type specified, it's ListObjects v1 by default when no object key
+			const pathWithoutBucket = url.pathname.replace(`/${myBucket}`, '').replace(/^\/+/, '');
+			if (!pathWithoutBucket && !url.searchParams.has('list-type')) {
+				return new Response('ListObjects v1 not implemented yet', { status: 501 });
+			}
+
+			// ListObjectVersions - not implemented yet
+			if (url.searchParams.has('versions')) {
+				return new Response('ListObjectVersions not implemented yet', { status: 501 });
+			}
+
+			// ListMultipartUploads - not implemented yet
+			if (url.searchParams.has('uploads')) {
+				return new Response('ListMultipartUploads not implemented yet', { status: 501 });
+			}
 		}
 
 		// Extract the object key, handling bucket names in the path
