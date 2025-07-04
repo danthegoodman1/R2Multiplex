@@ -10,9 +10,16 @@ function toHex(buffer: ArrayBuffer): string {
 	return [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-function pickBucket(key: string): string {
-	const sum = key.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
-	const index = sum % buckets.length;
+async function pickBucket(key: string): Promise<string> {
+	const encoder = new TextEncoder();
+	const data = encoder.encode(key);
+	const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+
+	// Convert first 4 bytes of hash to a number for modulo
+	const hashArray = new Uint8Array(hashBuffer);
+	const hashNumber = (hashArray[0] << 24) | (hashArray[1] << 16) | (hashArray[2] << 8) | hashArray[3];
+	const index = Math.abs(hashNumber) % buckets.length;
+
 	return buckets[index];
 }
 
@@ -307,7 +314,7 @@ async function handleListObjectsV2(req: Request, env: Env): Promise<Response> {
 	let nextContinuationToken: string | undefined;
 	if (isTruncated && resultObjects.length > 0) {
 		const lastKey = resultObjects[resultObjects.length - 1].Key;
-		const lastBucket = pickBucket(lastKey);
+		const lastBucket = await pickBucket(lastKey);
 		const token = {
 			bucket: lastBucket,
 			key: lastKey,
@@ -419,7 +426,7 @@ export default {
 			return new Response('Bad Request: No key specified', { status: 400 });
 		}
 
-		const bucket = pickBucket(key);
+		const bucket = await pickBucket(key);
 		console.log('Selected bucket:', bucket, 'for key:', key);
 
 		// Forward the request to the selected bucket
